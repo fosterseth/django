@@ -87,13 +87,13 @@ class Collector:
         """
         if not objs:
             return []
-        new_objs = []
-        model = objs[0].__class__
-        instances = self.data.setdefault(model, set())
-        for obj in objs:
-            if obj not in instances:
-                new_objs.append(obj)
-        instances.update(new_objs)
+        model = objs.model
+        # self.data.update({model: objs})
+        self.data.setdefault(model, None)
+        if self.data[model]:
+            self.data[model] = self.data[model] | objs
+        else:
+            self.data[model] = objs
         # Nullable relationships can be ignored -- they are nulled out before
         # deleting, and therefore do not affect the order in which objects have
         # to be deleted.
@@ -102,7 +102,7 @@ class Collector:
                 source, model = model, source
             self.dependencies.setdefault(
                 source._meta.concrete_model, set()).add(model._meta.concrete_model)
-        return new_objs
+        return objs
 
     def add_field_update(self, field, value, objs):
         """
@@ -112,9 +112,13 @@ class Collector:
         if not objs:
             return
         model = objs[0].__class__
-        self.field_updates.setdefault(
-            model, {}).setdefault(
-            (field, value), set()).update(objs)
+        self.field_updates.setdefault(model, {})
+        self.field_updates[model].setdefault((field, value), None)
+        if self.field_updates[model][(field, value)]:
+            self.field_updates[model][(field, value)] = self.field_updates[model][(field, value)] | objs
+        else:
+            self.field_updates[model][(field, value)] = objs
+
 
     def can_fast_delete(self, objs, from_field=None):
         """
@@ -185,6 +189,7 @@ class Collector:
 
         If 'keep_parents' is True, data of parent model's will be not deleted.
         """
+
         if self.can_fast_delete(objs):
             self.fast_deletes.append(objs)
             return
@@ -193,17 +198,16 @@ class Collector:
         if not new_objs:
             return
 
-        model = new_objs[0].__class__
+        model = new_objs.model
 
         if not keep_parents:
             # Recursively collect concrete model's parent models, but not their
             # related objects. These will be found by meta.get_fields()
             concrete_model = model._meta.concrete_model
-            for ptr in concrete_model._meta.parents.values():
+            for ptr in concrete_model._meta.parents.keys():
                 if ptr:
-                    parent_objs = [getattr(obj, ptr.name) for obj in new_objs]
+                    parent_objs = ptr.objects.filter(pk__in = new_objs.values_list('pk', flat=True))
                     self.collect(parent_objs, source=model,
-                                 source_attr=ptr.remote_field.related_name,
                                  collect_related=False,
                                  reverse_dependency=True)
         if collect_related:
@@ -215,13 +219,11 @@ class Collector:
                 field = related.field
                 if field.remote_field.on_delete == DO_NOTHING:
                     continue
-                batches = self.get_del_batches(new_objs, field)
-                for batch in batches:
-                    sub_objs = self.related_objects(related, batch)
-                    if self.can_fast_delete(sub_objs, from_field=field):
-                        self.fast_deletes.append(sub_objs)
-                    elif sub_objs:
-                        field.remote_field.on_delete(self, field, sub_objs, self.using)
+                related_qs = self.related_objects(related, new_objs)
+                if self.can_fast_delete(related_qs, from_field=field):
+                    self.fast_deletes.append(related_qs)
+                elif related_qs:
+                    field.remote_field.on_delete(self, field, related_qs, self.using)
             for field in model._meta.private_fields:
                 if hasattr(field, 'bulk_related_objects'):
                     # It's something like generic foreign key.
@@ -261,69 +263,32 @@ class Collector:
                                 for model in sorted_models)
 
     def delete(self):
-        # sort instance collections
-        for model, instances in self.data.items():
-            self.data[model] = sorted(instances, key=attrgetter("pk"))
-
-        # if possible, bring the models in an order suitable for databases that
-        # don't support transactions or cannot defer constraint checks until the
-        # end of a transaction.
         self.sort()
         # number of objects deleted for each model label
+
+        # collect pk_list before deletion (once things start to delete
+        # queries might not be able to retreive pk list)
+        del_dict = OrderedDict()
+        for model, instances in self.data.items():
+            del_dict[model] = list(instances.values_list('pk', flat=True))
+
         deleted_counter = Counter()
 
-        # Optimize for the case with a single obj and no dependencies
-        if len(self.data) == 1 and len(instances) == 1:
-            instance = list(instances)[0]
-            if self.can_fast_delete(instance):
-                with transaction.mark_for_rollback_on_error():
-                    count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
-                setattr(instance, model._meta.pk.attname, None)
-                return count, {model._meta.label: count}
-
         with transaction.atomic(using=self.using, savepoint=False):
-            # send pre_delete signals
-            for model, obj in self.instances_with_model():
-                if not model._meta.auto_created:
-                    signals.pre_delete.send(
-                        sender=model, instance=obj, using=self.using
-                    )
-
-            # fast deletes
-            for qs in self.fast_deletes:
-                count = qs._raw_delete(using=self.using)
-                deleted_counter[qs.model._meta.label] += count
 
             # update fields
             for model, instances_for_fieldvalues in self.field_updates.items():
                 for (field, value), instances in instances_for_fieldvalues.items():
                     query = sql.UpdateQuery(model)
-                    query.update_batch([obj.pk for obj in instances],
+                    query.update_batch(instances.values_list('pk', flat=True),
                                        {field.name: value}, self.using)
-
-            # reverse instance collections
-            for instances in self.data.values():
-                instances.reverse()
+            # fast deletes
+            for qs in self.fast_deletes:
+                count = qs._raw_delete(using=self.using)
+                deleted_counter[qs.model._meta.label] += count
 
             # delete instances
-            for model, instances in self.data.items():
+            for model, pk_list in del_dict.items():
                 query = sql.DeleteQuery(model)
-                pk_list = [obj.pk for obj in instances]
                 count = query.delete_batch(pk_list, self.using)
                 deleted_counter[model._meta.label] += count
-
-                if not model._meta.auto_created:
-                    for obj in instances:
-                        signals.post_delete.send(
-                            sender=model, instance=obj, using=self.using
-                        )
-
-        # update collected instances
-        for instances_for_fieldvalues in self.field_updates.values():
-            for (field, value), instances in instances_for_fieldvalues.items():
-                for obj in instances:
-                    setattr(obj, field.attname, value)
-        for model, instances in self.data.items():
-            for instance in instances:
-                setattr(instance, model._meta.pk.attname, None)
-        return sum(deleted_counter.values()), dict(deleted_counter)
