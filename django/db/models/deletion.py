@@ -1,6 +1,7 @@
 from collections import Counter, OrderedDict
 from operator import attrgetter
 
+from django.contrib.contenttypes.models import ContentType
 from django.db import IntegrityError, connections, transaction
 from django.db.models import signals, sql
 
@@ -22,7 +23,7 @@ def PROTECT(collector, field, sub_objs, using):
     raise ProtectedError(
         "Cannot delete some instances of model '%s' because they are "
         "referenced through a protected foreign key: '%s.%s'" % (
-            field.remote_field.model.__name__, sub_objs[0].__class__.__name__, field.name
+            field.remote_field.model.__name__, sub_objs.model.__name__, field.name
         ),
         sub_objs
     )
@@ -59,9 +60,19 @@ def get_candidate_relations_to_delete(opts):
         if f.auto_created and not f.concrete and (f.one_to_one or f.one_to_many)
     )
 
+def bulk_related_objects(field, objs, using):
+    """
+    Return all objects related to ``objs`` via this ``GenericRelation``.
+    """
+    return field.remote_field.model._base_manager.db_manager(using).filter(**{
+        "%s__pk" % field.content_type_field_name: ContentType.objects.db_manager(using).get_for_model(
+            field.model, for_concrete_model=field.for_concrete_model).pk,
+        "%s__in" % field.object_id_field_name: list(objs.values_list('pk', flat=True))
+    })
+
 
 class Collector:
-    def __init__(self, using):
+    def __init__(self, using, logger=None):
         self.using = using
         # Initially, {model: {instances}}, later values become lists.
         self.data = OrderedDict()
@@ -77,6 +88,8 @@ class Collector:
         # parent.
         self.dependencies = {}  # {model: {models}}
 
+        self.logger = logger
+
     def add(self, objs, source=None, nullable=False, reverse_dependency=False):
         """
         Add 'objs' to the collection of objects to be deleted.  If the call is
@@ -85,15 +98,12 @@ class Collector:
 
         Return a list of all objects that were not already collected.
         """
-        if not objs:
-            return []
+        if not objs.exists():
+            return objs
         model = objs.model
         # self.data.update({model: objs})
-        self.data.setdefault(model, None)
-        if self.data[model]:
-            self.data[model] = self.data[model] | objs
-        else:
-            self.data[model] = objs
+        self.data.setdefault(model, [])
+        self.data[model].append(objs)
         # Nullable relationships can be ignored -- they are nulled out before
         # deleting, and therefore do not affect the order in which objects have
         # to be deleted.
@@ -109,15 +119,12 @@ class Collector:
         Schedule a field update. 'objs' must be a homogeneous iterable
         collection of model instances (e.g. a QuerySet).
         """
-        if not objs:
+        if not objs.exists():
             return
-        model = objs[0].__class__
+        model = objs.model
         self.field_updates.setdefault(model, {})
-        self.field_updates[model].setdefault((field, value), None)
-        if self.field_updates[model][(field, value)]:
-            self.field_updates[model][(field, value)] = self.field_updates[model][(field, value)] | objs
-        else:
-            self.field_updates[model][(field, value)] = objs
+        self.field_updates[model].setdefault((field, value), [])
+        self.field_updates[model][(field, value)].append(objs)
 
 
     def can_fast_delete(self, objs, from_field=None):
@@ -189,13 +196,14 @@ class Collector:
 
         If 'keep_parents' is True, data of parent model's will be not deleted.
         """
-
+        if self.logger:
+            self.logger.info("Collecting objects for %s", objs.model.__name__)
         if self.can_fast_delete(objs):
             self.fast_deletes.append(objs)
             return
         new_objs = self.add(objs, source, nullable,
                             reverse_dependency=reverse_dependency)
-        if not new_objs:
+        if not new_objs.exists():
             return
 
         model = new_objs.model
@@ -227,7 +235,7 @@ class Collector:
             for field in model._meta.private_fields:
                 if hasattr(field, 'bulk_related_objects'):
                     # It's something like generic foreign key.
-                    sub_objs = field.bulk_related_objects(new_objs, self.using)
+                    sub_objs = bulk_related_objects(field, new_objs, self.using)
                     self.collect(sub_objs, source=model, nullable=True)
 
     def related_objects(self, related, objs):
@@ -244,6 +252,8 @@ class Collector:
                 yield model, obj
 
     def sort(self):
+        if self.logger:
+            self.logger.info("Sorting objects to delete")
         sorted_models = []
         concrete_models = set()
         models = list(self.data)
@@ -270,7 +280,9 @@ class Collector:
         # queries might not be able to retreive pk list)
         del_dict = OrderedDict()
         for model, instances in self.data.items():
-            del_dict[model] = list(instances.values_list('pk', flat=True))
+            del_dict.setdefault(model, [])
+            for inst in instances:
+                del_dict[model] += list(inst.values_list('pk', flat=True))
 
         deleted_counter = Counter()
 
@@ -278,10 +290,13 @@ class Collector:
 
             # update fields
             for model, instances_for_fieldvalues in self.field_updates.items():
+                if self.logger:
+                    self.logger.info("Updating fields for %s", model.__name__)
                 for (field, value), instances in instances_for_fieldvalues.items():
-                    query = sql.UpdateQuery(model)
-                    query.update_batch(instances.values_list('pk', flat=True),
-                                       {field.name: value}, self.using)
+                    for inst in instances:
+                        query = sql.UpdateQuery(model)
+                        query.update_batch(inst.values_list('pk', flat=True),
+                                           {field.name: value}, self.using)
             # fast deletes
             for qs in self.fast_deletes:
                 count = qs._raw_delete(using=self.using)
@@ -289,6 +304,8 @@ class Collector:
 
             # delete instances
             for model, pk_list in del_dict.items():
+                if self.logger:
+                    self.logger.info("Deleting objects for %s", model.__name__)
                 query = sql.DeleteQuery(model)
                 count = query.delete_batch(pk_list, self.using)
                 deleted_counter[model._meta.label] += count
