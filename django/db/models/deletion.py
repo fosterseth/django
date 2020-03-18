@@ -89,7 +89,6 @@ class Collector:
         if not objs.exists():
             return objs
         model = objs.model
-        # self.data.update({model: objs})
         self.data.setdefault(model, [])
         self.data[model].append(objs)
         # Nullable relationships can be ignored -- they are nulled out before
