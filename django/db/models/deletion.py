@@ -1,7 +1,6 @@
 from collections import Counter, OrderedDict
 from operator import attrgetter
 
-from django.contrib.contenttypes.models import ContentType
 from django.db import IntegrityError, connections, transaction
 from django.db.models import signals, sql
 
@@ -60,19 +59,9 @@ def get_candidate_relations_to_delete(opts):
         if f.auto_created and not f.concrete and (f.one_to_one or f.one_to_many)
     )
 
-def bulk_related_objects(field, objs, using):
-    """
-    Return all objects related to ``objs`` via this ``GenericRelation``.
-    """
-    return field.remote_field.model._base_manager.db_manager(using).filter(**{
-        "%s__pk" % field.content_type_field_name: ContentType.objects.db_manager(using).get_for_model(
-            field.model, for_concrete_model=field.for_concrete_model).pk,
-        "%s__in" % field.object_id_field_name: list(objs.values_list('pk', flat=True))
-    })
-
 
 class Collector:
-    def __init__(self, using, logger=None):
+    def __init__(self, using):
         self.using = using
         # Initially, {model: {instances}}, later values become lists.
         self.data = OrderedDict()
@@ -88,7 +77,6 @@ class Collector:
         # parent.
         self.dependencies = {}  # {model: {models}}
 
-        self.logger = logger
 
     def add(self, objs, source=None, nullable=False, reverse_dependency=False):
         """
@@ -196,8 +184,10 @@ class Collector:
 
         If 'keep_parents' is True, data of parent model's will be not deleted.
         """
-        if self.logger:
-            self.logger.info("Collecting objects for %s", objs.model.__name__)
+
+        if hasattr(objs, 'polymorphic_disabled'):
+            objs.polymorphic_disabled = True
+
         if self.can_fast_delete(objs):
             self.fast_deletes.append(objs)
             return
@@ -252,8 +242,6 @@ class Collector:
                 yield model, obj
 
     def sort(self):
-        if self.logger:
-            self.logger.info("Sorting objects to delete")
         sorted_models = []
         concrete_models = set()
         models = list(self.data)
@@ -274,7 +262,6 @@ class Collector:
 
     def delete(self):
         self.sort()
-        # number of objects deleted for each model label
 
         # collect pk_list before deletion (once things start to delete
         # queries might not be able to retreive pk list)
@@ -290,8 +277,6 @@ class Collector:
 
             # update fields
             for model, instances_for_fieldvalues in self.field_updates.items():
-                if self.logger:
-                    self.logger.info("Updating fields for %s", model.__name__)
                 for (field, value), instances in instances_for_fieldvalues.items():
                     for inst in instances:
                         query = sql.UpdateQuery(model)
@@ -304,8 +289,8 @@ class Collector:
 
             # delete instances
             for model, pk_list in del_dict.items():
-                if self.logger:
-                    self.logger.info("Deleting objects for %s", model.__name__)
                 query = sql.DeleteQuery(model)
                 count = query.delete_batch(pk_list, self.using)
                 deleted_counter[model._meta.label] += count
+
+            return sum(deleted_counter.values()), dict(deleted_counter)
